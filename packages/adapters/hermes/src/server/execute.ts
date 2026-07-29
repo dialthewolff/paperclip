@@ -72,6 +72,14 @@ function cfgStringArray(v: unknown): string[] | undefined {
     : undefined;
 }
 
+function resolvePaperclipApiUrl(config: Record<string, unknown>, runtimeApiUrl?: string): string {
+  return cfgString(config.paperclipApiUrl) || runtimeApiUrl || process.env.PAPERCLIP_API_URL || "http://127.0.0.1:3100";
+}
+
+function withPaperclipApiPath(apiUrl: string): string {
+  return apiUrl.endsWith("/api") ? apiUrl : apiUrl.replace(/\/+$/, "") + "/api";
+}
+
 export function resolveHermesCommand(config: Record<string, unknown>): string {
   return cfgString(config.hermesCommand) || cfgString(config.command) || HERMES_CLI;
 }
@@ -150,15 +158,7 @@ export function buildPrompt(
   const companyName = cfgString(context.companyName) || cfgString(ctx.config?.companyName) || "";
   const projectName = cfgString(context.projectName) || cfgString(ctx.config?.projectName) || "";
 
-  // Build API URL — ensure it has the /api path
-  let paperclipApiUrl =
-    cfgString(config.paperclipApiUrl) ||
-    process.env.PAPERCLIP_API_URL ||
-    "http://127.0.0.1:3100/api";
-  // Ensure /api suffix
-  if (!paperclipApiUrl.endsWith("/api")) {
-    paperclipApiUrl = paperclipApiUrl.replace(/\/+$/, "") + "/api";
-  }
+  const paperclipApiUrl = withPaperclipApiPath(resolvePaperclipApiUrl(config));
 
   const paperclipTaskMarkdown = selectPaperclipTaskMarkdown(context, {
     resumedSession: options.resumedSession === true,
@@ -349,6 +349,8 @@ export async function execute(
   const prevSessionId = cfgString(
     (ctx.runtime?.sessionParams as Record<string, unknown> | null)?.sessionId,
   );
+  const paperclipRuntimeEnv = buildPaperclipEnv(ctx.agent);
+  const paperclipApiUrl = resolvePaperclipApiUrl(config, paperclipRuntimeEnv.PAPERCLIP_API_URL);
 
   // ── Resolve provider (defense in depth) ────────────────────────────────
   // Priority chain:
@@ -409,7 +411,7 @@ export async function execute(
   }
 
   // ── Build prompt ───────────────────────────────────────────────────────
-  let prompt = buildPrompt(ctx, config, { resumedSession: Boolean(prevSessionId) });
+  let prompt = buildPrompt(ctx, { ...config, paperclipApiUrl }, { resumedSession: Boolean(prevSessionId) });
   if (agentInstructions) {
     prompt = agentInstructions + "\n\n---\n\n" + prompt;
   }
@@ -466,7 +468,8 @@ export async function execute(
   const env: Record<string, string> = {
     ...(process.env as Record<string, string>),
     ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
-    ...buildPaperclipEnv(ctx.agent),
+    ...paperclipRuntimeEnv,
+    PAPERCLIP_API_URL: paperclipApiUrl,
   };
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;

@@ -136,4 +136,55 @@ describe("hermes-local adapter onSpawn forwarding", () => {
       else process.env.PAPERCLIP_API_KEY = previousApiKey;
     }
   });
+
+  it("uses an explicit callback URL for both the child environment and prompt", async () => {
+    const previousRuntimeUrl = process.env.PAPERCLIP_RUNTIME_API_URL;
+    const previousPublicUrl = process.env.PAPERCLIP_PUBLIC_URL;
+    process.env.PAPERCLIP_RUNTIME_API_URL = "http://runtime.paperclip.test:3100";
+    process.env.PAPERCLIP_PUBLIC_URL = "https://public.paperclip.test";
+
+    try {
+      const { ctx } = makeCtx({ paperclipApiUrl: "http://127.0.0.1:3100" });
+      await execute(ctx as any);
+
+      const lastCall = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
+      const prompt = lastCall[2][2];
+      const opts = lastCall[3] as { env: Record<string, string> };
+      expect(opts.env.PAPERCLIP_API_URL).toBe("http://127.0.0.1:3100");
+      expect(prompt).toContain("API base: http://127.0.0.1:3100/api");
+      expect(process.env.PAPERCLIP_PUBLIC_URL).toBe("https://public.paperclip.test");
+      expect(opts.env.PAPERCLIP_PUBLIC_URL).toBe("https://public.paperclip.test");
+    } finally {
+      if (previousRuntimeUrl === undefined) delete process.env.PAPERCLIP_RUNTIME_API_URL;
+      else process.env.PAPERCLIP_RUNTIME_API_URL = previousRuntimeUrl;
+      if (previousPublicUrl === undefined) delete process.env.PAPERCLIP_PUBLIC_URL;
+      else process.env.PAPERCLIP_PUBLIC_URL = previousPublicUrl;
+    }
+  });
+
+  it("falls back to the computed runtime callback URL without logging credentials", async () => {
+    const previousRuntimeUrl = process.env.PAPERCLIP_RUNTIME_API_URL;
+    const previousApiKey = process.env.PAPERCLIP_API_KEY;
+    process.env.PAPERCLIP_RUNTIME_API_URL = "http://runtime.paperclip.test:3100";
+    process.env.PAPERCLIP_API_KEY = "parent-process-key";
+
+    try {
+      const { ctx } = makeCtx();
+      await execute(ctx as any);
+
+      const lastCall = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
+      const prompt = lastCall[2][2];
+      const opts = lastCall[3] as { env: Record<string, string> };
+      expect(opts.env.PAPERCLIP_API_URL).toBe("http://runtime.paperclip.test:3100");
+      expect(prompt).toContain("API base: http://runtime.paperclip.test:3100/api");
+      expect(opts.env.PAPERCLIP_API_KEY).toBeUndefined();
+      expect(prompt).not.toContain("parent-process-key");
+      expect(vi.mocked(ctx.onLog).mock.calls.flat().join("\n")).not.toContain("parent-process-key");
+    } finally {
+      if (previousRuntimeUrl === undefined) delete process.env.PAPERCLIP_RUNTIME_API_URL;
+      else process.env.PAPERCLIP_RUNTIME_API_URL = previousRuntimeUrl;
+      if (previousApiKey === undefined) delete process.env.PAPERCLIP_API_KEY;
+      else process.env.PAPERCLIP_API_KEY = previousApiKey;
+    }
+  });
 });
