@@ -78,6 +78,25 @@ function resolveProcessGroupId(child: ChildProcess) {
   return typeof child.pid === "number" && child.pid > 0 ? child.pid : null;
 }
 
+function isProcessGroupAlive(processGroupId: number | null) {
+  if (process.platform === "win32" || !processGroupId || processGroupId <= 0) return false;
+  try {
+    process.kill(-processGroupId, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForProcessGroupExit(processGroupId: number | null, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessGroupAlive(processGroupId)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return !isProcessGroupAlive(processGroupId);
+}
+
 // Exported so the direct-child fallback branch can be unit-tested directly.
 export function signalRunningProcess(
   running: Pick<RunningProcess, "child" | "processGroupId">,
@@ -3349,10 +3368,30 @@ export async function runChildProcess(
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
-          void logChain.finally(() => {
-            void Promise.resolve()
-              .then(() => target.cleanup?.())
-              .finally(() => {
+          void logChain.finally(async () => {
+            if (
+              opts.terminalResultCleanup &&
+              terminalResultSeen &&
+              isProcessGroupAlive(processGroupId)
+            ) {
+              terminalCleanupStarted = true;
+              terminalCleanupSignal = "SIGTERM";
+              signalRunningProcess({ child, processGroupId }, "SIGTERM");
+              if (
+                !(await waitForProcessGroupExit(
+                  processGroupId,
+                  Math.max(1, opts.graceSec) * 1000,
+                ))
+              ) {
+                terminalCleanupSignal = "SIGKILL";
+                terminalCleanupForceKilled = true;
+                signalRunningProcess({ child, processGroupId }, "SIGKILL");
+                await waitForProcessGroupExit(processGroupId, 1_000);
+              }
+            }
+            try {
+              await target.cleanup?.();
+            } finally {
               resolve({
                 exitCode: code,
                 signal,
@@ -3373,7 +3412,7 @@ export async function runChildProcess(
                   }
                   : null,
               });
-              });
+            }
           });
         });
       })

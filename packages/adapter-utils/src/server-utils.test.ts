@@ -607,6 +607,45 @@ describe("runChildProcess", () => {
     expect(await waitForPidExit(descendantPid, 2_000)).toBe(true);
   });
 
+  it.skipIf(process.platform === "win32")("cleans up a lingering process group after the direct child closes", async () => {
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      [
+        "-e",
+        [
+          "const { spawn } = require('node:child_process');",
+          "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
+          "process.stdout.write(`descendant:${child.pid}\\n`);",
+          "process.stdout.write(`${JSON.stringify({ type: 'result', result: 'done' })}\\n`);",
+          "setTimeout(() => process.exit(0), 25);",
+        ].join(" "),
+      ],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 0,
+        graceSec: 1,
+        onLog: async () => {},
+        terminalResultCleanup: {
+          graceMs: 100,
+          hasTerminalResult: ({ stdout }) => stdout.includes('"type":"result"'),
+        },
+      },
+    );
+
+    const descendantPid = Number.parseInt(result.stdout.match(/descendant:(\d+)/)?.[1] ?? "", 10);
+    expect(result.exitCode).toBe(0);
+    expect(result.terminalResultCleanup).toMatchObject({
+      kind: "terminal_result_cleanup",
+      stopped: true,
+      signal: "SIGTERM",
+      forceKilled: false,
+    });
+    expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
+    expect(await waitForPidExit(descendantPid, 2_000)).toBe(true);
+  });
+
   it.skipIf(process.platform === "win32")("cleans up a still-running child after terminal output", async () => {
     const result = await runChildProcess(
       randomUUID(),

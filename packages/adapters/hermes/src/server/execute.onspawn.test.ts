@@ -187,4 +187,53 @@ describe("hermes-local adapter onSpawn forwarding", () => {
       else process.env.PAPERCLIP_API_KEY = previousApiKey;
     }
   });
+
+  it("persists and resumes the session ID from Hermes non-quiet output", async () => {
+    const mocked = vi.mocked(serverUtils.runChildProcess);
+    mocked.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: [
+        "Completed the assigned work.",
+        "",
+        "Resume this session with:",
+        "  hermes --resume 20260729_013020_07d7ca",
+        "",
+        "Session:        20260729_013020_07d7ca",
+      ].join("\n"),
+      stderr: "",
+      pid: 123,
+      startedAt: "2026-07-29T01:30:20.000Z",
+    });
+
+    const { ctx } = makeCtx();
+    const first = await execute(ctx as any);
+
+    expect(first.sessionParams).toEqual({ sessionId: "20260729_013020_07d7ca" });
+    expect(first.sessionDisplayId).toBe("20260729_013020_");
+
+    const firstOptions = mocked.mock.calls.at(-1)![3];
+    expect(firstOptions.terminalResultCleanup?.hasTerminalResult({
+      stdout: "Session:        20260729_013020_07d7ca\n",
+      stderr: "",
+    })).toBe(true);
+
+    mocked.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "session_id: 20260729_013020_07d7ca\n",
+      stderr: "",
+      pid: 124,
+      startedAt: "2026-07-29T01:35:00.000Z",
+    });
+    (ctx.runtime as Record<string, unknown>).sessionParams = {
+      sessionId: "20260729_013020_07d7ca",
+    };
+    await execute(ctx as any);
+
+    expect(mocked.mock.calls.at(-1)![2]).toContain("--resume");
+    expect(mocked.mock.calls.at(-1)![2]).toContain("20260729_013020_07d7ca");
+  });
 });

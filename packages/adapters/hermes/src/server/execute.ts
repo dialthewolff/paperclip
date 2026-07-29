@@ -219,6 +219,9 @@ const SESSION_ID_REGEX = /^session_id:\s*(\S+)/m;
 /** Regex for legacy session output format */
 const SESSION_ID_REGEX_LEGACY = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i;
 
+/** Regex for the standard non-quiet exit summary: "Session: <id>" */
+const SESSION_ID_REGEX_SUMMARY = /^Session:\s*(\S+)/m;
+
 /** Regex to extract token usage from Hermes output. */
 const TOKEN_USAGE_REGEX =
   /tokens?[:\s]+(\d+)\s*(?:input|in)\b.*?(\d+)\s*(?:output|out)\b/i;
@@ -232,6 +235,14 @@ interface ParsedOutput {
   usage?: UsageSummary;
   costUsd?: number;
   errorMessage?: string;
+}
+
+function extractHermesSessionId(stdout: string, stderr: string): string | undefined {
+  return (
+    stdout.match(SESSION_ID_REGEX)?.[1] ??
+    (stdout + "\n" + stderr).match(SESSION_ID_REGEX_LEGACY)?.[1] ??
+    stdout.match(SESSION_ID_REGEX_SUMMARY)?.[1]
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -284,11 +295,7 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
       result.response = cleanResponse(stdout.slice(0, sessionLineIdx));
     }
   } else {
-    // Legacy format (non-quiet mode)
-    const legacyMatch = combined.match(SESSION_ID_REGEX_LEGACY);
-    if (legacyMatch?.[1]) {
-      result.sessionId = legacyMatch?.[1] ?? null;
-    }
+    result.sessionId = extractHermesSessionId(stdout, stderr);
     // In non-quiet mode, extract clean response from stdout by
     // filtering out tool lines, system messages, and noise
     const cleaned = cleanResponse(stdout);
@@ -542,6 +549,9 @@ export async function execute(
     graceSec,
     onLog: wrappedOnLog,
     onSpawn: ctx.onSpawn,
+    terminalResultCleanup: {
+      hasTerminalResult: ({ stdout, stderr }) => Boolean(extractHermesSessionId(stdout, stderr)),
+    },
   });
 
   // ── Parse output ───────────────────────────────────────────────────────
