@@ -6,8 +6,10 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
   agentWakeupRequests,
+  activityLog,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issues,
@@ -638,6 +640,284 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
         const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
         return runs.length === 2 && runs.every((run) => ["cancelled", "succeeded"].includes(run.status));
       }, 90_000);
+    } finally {
+      gateway.releaseFirstWait();
+      await gateway.close();
+    }
+  }, 120_000);
+
+  it("coalesces a paired task-bridge resume after the interaction run satisfies it", async () => {
+    const gateway = await createControlledGatewayServer();
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const interactionId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const heartbeat = heartbeatService(db);
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Gateway Agent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "openclaw_gateway",
+        adapterConfig: {
+          url: gateway.url,
+          headers: { "x-openclaw-token": "gateway-token" },
+          payloadTemplate: { message: "wake now" },
+          waitTimeoutMs: 2_000,
+        },
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Review task-bridge result",
+        status: "in_progress",
+        priority: "medium",
+        responsibleUserId: "responsible-user",
+        assigneeAgentId: agentId,
+        originKind: "task_bridge",
+        originId: randomUUID(),
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      });
+
+      const firstRun = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: {
+          issueId,
+          interactionId,
+          interactionKind: "request_confirmation",
+          interactionStatus: "rejected",
+          mutation: "interaction",
+        },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          interactionId,
+          interactionKind: "request_confirmation",
+          interactionStatus: "rejected",
+          wakeReason: "issue_commented",
+          source: "issue.interaction.reject",
+        },
+        requestedByActorType: "user",
+        requestedByActorId: "user-1",
+      });
+
+      expect(firstRun).not.toBeNull();
+      await waitFor(() => gateway.getAgentPayloads().length === 1);
+
+      const pairedAt = new Date();
+      await db
+        .update(agentWakeupRequests)
+        .set({ requestedAt: pairedAt })
+        .where(eq(agentWakeupRequests.id, firstRun!.wakeupRequestId!));
+      const resumeAt = new Date(pairedAt.getTime() - 1);
+      const resumeComment = await db
+        .insert(issueComments)
+        .values({
+          companyId,
+          issueId,
+          authorType: "user",
+          authorUserId: "user-1",
+          body: "Resume with the reviewed correction.",
+          createdAt: resumeAt,
+          updatedAt: resumeAt,
+        })
+        .returning()
+        .then((rows) => rows[0]);
+
+      const deferredRun = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_reopened_via_comment",
+        payload: {
+          issueId,
+          commentId: resumeComment.id,
+          mutation: "comment",
+          resumeIntent: true,
+          followUpRequested: true,
+        },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          commentId: resumeComment.id,
+          wakeCommentId: resumeComment.id,
+          wakeReason: "issue_reopened_via_comment",
+          source: "issue.comment.reopen",
+          resumeIntent: true,
+          followUpRequested: true,
+        },
+        requestedByActorType: "user",
+        requestedByActorId: "user-1",
+      });
+
+      expect(deferredRun).toBeNull();
+      const deferred = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.agentId, agentId),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      expect(deferred).not.toBeNull();
+
+      const resultAt = new Date(pairedAt.getTime() + 1);
+      const deferredAt = new Date(resultAt.getTime() + 1);
+      const completedAt = new Date(deferredAt.getTime() + 1);
+      await db
+        .update(agentWakeupRequests)
+        .set({ requestedAt: deferredAt })
+        .where(eq(agentWakeupRequests.id, deferred!.id));
+      const resultComment = await db
+        .insert(issueComments)
+        .values({
+          companyId,
+          issueId,
+          authorType: "agent",
+          authorAgentId: agentId,
+          createdByRunId: firstRun!.id,
+          body: "Accepted task-bridge result.",
+          metadata: {
+            version: 1,
+            sections: [{
+              rows: [{
+                type: "code",
+                label: "paperclip_lykos_result_packet.v1",
+                language: "json",
+                code: JSON.stringify({ disposition: "completed" }),
+              }],
+            }],
+          },
+          createdAt: resultAt,
+          updatedAt: resultAt,
+        })
+        .returning()
+        .then((rows) => rows[0]);
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        runId: firstRun!.id,
+        action: "issue.comment_added",
+        entityType: "issue",
+        entityId: issueId,
+        details: { commentId: resultComment.id },
+        createdAt: resultAt,
+      });
+      await db
+        .update(issues)
+        .set({ status: "done", completedAt, updatedAt: completedAt })
+        .where(eq(issues.id, issueId));
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        runId: firstRun!.id,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: issueId,
+        details: { status: "done" },
+        createdAt: completedAt,
+      });
+
+      gateway.releaseFirstWait();
+
+      await waitFor(async () => {
+        const [run, wake] = await Promise.all([
+          db
+            .select({ status: heartbeatRuns.status })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, firstRun!.id))
+            .then((rows) => rows[0] ?? null),
+          db
+            .select()
+            .from(agentWakeupRequests)
+            .where(eq(agentWakeupRequests.id, deferred!.id))
+            .then((rows) => rows[0] ?? null),
+        ]);
+        return run?.status === "succeeded" && wake?.status === "coalesced";
+      }, 90_000);
+
+      expect(gateway.getAgentPayloads()).toHaveLength(1);
+      expect(
+        await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)),
+      ).toHaveLength(1);
+      expect(
+        await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, deferred!.id))
+          .then((rows) => rows[0]),
+      ).toMatchObject({
+        status: "coalesced",
+        reason: "issue_execution_satisfied",
+        runId: firstRun!.id,
+        coalescedCount: 1,
+      });
+      expect(
+        (await db
+          .select({ status: agentWakeupRequests.status })
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.agentId, agentId)))
+          .map((wake) => wake.status)
+          .sort(),
+      ).toEqual(["coalesced", "completed"]);
+      expect(
+        await db
+          .select({
+            status: issues.status,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(eq(issues.id, issueId))
+          .then((rows) => rows[0]),
+      ).toEqual({
+        status: "done",
+        executionRunId: null,
+      });
+      await waitFor(async () =>
+        !runningProcesses.has(firstRun!.id) &&
+        Boolean(
+          await db
+            .select({ id: heartbeatRunEvents.id })
+            .from(heartbeatRunEvents)
+            .where(
+              and(
+                eq(heartbeatRunEvents.runId, firstRun!.id),
+                eq(heartbeatRunEvents.message, "run scratch cleaned"),
+              ),
+            )
+            .then((rows) => rows[0]),
+        )
+      );
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(
+        await db
+          .select({ status: agents.status })
+          .from(agents)
+          .where(eq(agents.id, agentId))
+          .then((rows) => rows[0]?.status),
+      ).toBe("idle");
     } finally {
       gateway.releaseFirstWait();
       await gateway.close();

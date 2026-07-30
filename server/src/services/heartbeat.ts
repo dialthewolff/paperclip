@@ -315,6 +315,11 @@ const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_released",
 ];
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+const TASK_BRIDGE_RESUME_COALESCE_WINDOW_MS = 2_000;
+// ponytail: this private-runtime marker is the causal proof we have today; replace it
+// with a continuationGroupId/result kind when a second task-bridge workflow needs coalescing.
+const PAPERCLIP_LYKOS_RESULT_PACKET_JSON_PATH =
+  '$.sections[*].rows[*] ? (@.type == "code" && @.label == "paperclip_lykos_result_packet.v1" && @.language == "json" && @.code.type() == "string")';
 const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_AGENT_MESSAGE_KEY = "paperclipAgentMessage";
@@ -14618,6 +14623,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
       }
 
+      const sourceWake = run.wakeupRequestId && run.status === "succeeded" && issue.originKind === "task_bridge"
+        ? await tx
+          .select()
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, run.wakeupRequestId))
+          .then((rows) => rows[0] ?? null)
+        : null;
+      const sourceWakePayload = parseObject(sourceWake?.payload);
 
       while (true) {
         const deferred = await tx
@@ -14627,6 +14640,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             and(
               eq(agentWakeupRequests.companyId, issue.companyId),
               eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              isNull(agentWakeupRequests.runId),
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
             ),
           )
@@ -14710,6 +14724,131 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         const deferredCommentIds = extractWakeCommentIds(deferredContextSeed);
         const deferredWakeReason = readNonEmptyString(deferredContextSeed.wakeReason);
+        const sourceInteractionId = readNonEmptyString(sourceWakePayload.interactionId);
+        const resumeComment =
+          sourceWakePayload.mutation === "interaction" &&
+          deferredPayload.mutation === "comment" &&
+          deferredCommentIds.length === 1
+            ? await tx
+              .select({
+                authorType: issueComments.authorType,
+                authorUserId: issueComments.authorUserId,
+                createdAt: issueComments.createdAt,
+              })
+              .from(issueComments)
+              .where(
+                and(
+                  eq(issueComments.id, deferredCommentIds[0]!),
+                  eq(issueComments.companyId, issue.companyId),
+                  eq(issueComments.issueId, issue.id),
+                  isNull(issueComments.deletedAt),
+                ),
+              )
+              .then((rows) => rows[0] ?? null)
+            : null;
+        const pairedWakeGapMs = sourceWake && resumeComment
+          ? Math.abs(resumeComment.createdAt.getTime() - sourceWake.requestedAt.getTime())
+          : Number.POSITIVE_INFINITY;
+        const isPairedTaskBridgeResume =
+          sourceWakePayload.mutation === "interaction" &&
+          sourceWakePayload.issueId === issue.id &&
+          sourceInteractionId !== null &&
+          sourceInteractionId === readNonEmptyString(runContext.interactionId) &&
+          runContext.source === "issue.interaction.reject" &&
+          sourceWake?.agentId === run.agentId &&
+          sourceWake.requestedByActorType === "user" &&
+          Boolean(sourceWake.requestedByActorId) &&
+          deferred.agentId === run.agentId &&
+          deferred.requestedByActorType === "user" &&
+          deferred.requestedByActorId === sourceWake.requestedByActorId &&
+          (deferred.coalescedCount ?? 0) === 0 &&
+          deferredPayload.mutation === "comment" &&
+          deferredPayload.resumeIntent === true &&
+          deferredPayload.followUpRequested === true &&
+          deferredContextSeed.source === "issue.comment.reopen" &&
+          deferredCommentIds.length === 1 &&
+          resumeComment?.authorType === "user" &&
+          resumeComment.authorUserId === sourceWake.requestedByActorId &&
+          pairedWakeGapMs <= TASK_BRIDGE_RESUME_COALESCE_WINDOW_MS &&
+          issue.status === "done";
+
+        if (isPairedTaskBridgeResume && resumeComment) {
+          const resultComments = await tx
+            .select({ id: issueComments.id, createdAt: issueComments.createdAt })
+            .from(issueComments)
+            .where(
+              and(
+                eq(issueComments.companyId, issue.companyId),
+                eq(issueComments.issueId, issue.id),
+                eq(issueComments.authorType, "agent"),
+                eq(issueComments.authorAgentId, run.agentId),
+                eq(issueComments.createdByRunId, run.id),
+                gte(issueComments.createdAt, resumeComment.createdAt),
+                isNull(issueComments.deletedAt),
+                isNull(issueComments.presentation),
+                sql`${issueComments.metadata} @> '{"version":1}'::jsonb`,
+                sql`jsonb_path_exists(
+                  ${issueComments.metadata},
+                  ${PAPERCLIP_LYKOS_RESULT_PACKET_JSON_PATH}::jsonpath
+                )`,
+              ),
+            )
+            .orderBy(asc(issueComments.createdAt));
+
+          if (resultComments.length > 0) {
+            const resultActivities = await tx
+              .select({
+                action: activityLog.action,
+                details: activityLog.details,
+                createdAt: activityLog.createdAt,
+              })
+              .from(activityLog)
+              .where(
+                and(
+                  eq(activityLog.companyId, issue.companyId),
+                  eq(activityLog.entityType, "issue"),
+                  eq(activityLog.entityId, issue.id),
+                  eq(activityLog.runId, run.id),
+                  gte(activityLog.createdAt, resumeComment.createdAt),
+                  inArray(activityLog.action, ["issue.comment_added", "issue.updated"]),
+                ),
+              )
+              .orderBy(asc(activityLog.createdAt));
+            const resultCommentIds = new Set(resultComments.map((comment) => comment.id));
+            const resultActivity = resultActivities.find((activity) =>
+              activity.action === "issue.comment_added" &&
+              resultCommentIds.has(readNonEmptyString(parseObject(activity.details).commentId) ?? "")
+            );
+            const completedAfterResult = resultActivity && resultActivities.some((activity) =>
+              activity.action === "issue.updated" &&
+              parseObject(activity.details).status === "done" &&
+              activity.createdAt.getTime() > resultActivity.createdAt.getTime()
+            );
+
+            if (completedAfterResult) {
+              const now = new Date();
+              await tx
+                .update(agentWakeupRequests)
+                .set({
+                  status: "coalesced",
+                  reason: "issue_execution_satisfied",
+                  runId: run.id,
+                  coalescedCount: (deferred.coalescedCount ?? 0) + 1,
+                  finishedAt: now,
+                  error: null,
+                  updatedAt: now,
+                })
+                .where(
+                  and(
+                    eq(agentWakeupRequests.id, deferred.id),
+                    eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                    isNull(agentWakeupRequests.runId),
+                  ),
+                );
+              continue;
+            }
+          }
+        }
         // Local-CLI agents post comments under user auth, so a self-comment from
         // the run that is now ending would otherwise look like a real human
         // comment and trigger a reopen on the very issue this run just closed.
