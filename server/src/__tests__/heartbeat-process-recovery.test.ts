@@ -3422,7 +3422,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
   });
 
-  it("terminates the in-memory process before persisting cancellation status", async () => {
+  it("persists cancellation before terminating so late adapter success cannot win", async () => {
     const { runId } = await seedRunFixture({
       agentStatus: "running",
       includeIssue: false,
@@ -3433,22 +3433,23 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       graceSec: 1,
       processGroupId: null,
     });
-    mockTerminateLocalService.mockResolvedValueOnce(undefined);
-    const updateSpy = vi.spyOn(db, "update");
-    updateSpy.mockImplementationOnce((() => {
-      throw new Error("db update unavailable");
-    }) as typeof db.update);
+    mockTerminateLocalService.mockImplementationOnce(async () => {
+      const lateSuccess = await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt: new Date() })
+        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
+        .returning();
+      expect(lateSuccess).toHaveLength(0);
+    });
 
-    try {
-      await expect(heartbeat.cancelRun(runId)).rejects.toThrow("db update unavailable");
-      expect(mockTerminateLocalService).toHaveBeenCalledWith(
-        expect.objectContaining({ pid: 12345, processGroupId: null }),
-        { forceAfterMs: 1000 },
-      );
-      expect(runningProcesses.has(runId)).toBe(false);
-    } finally {
-      updateSpy.mockRestore();
-    }
+    const cancelled = await heartbeat.cancelRun(runId);
+
+    expect(cancelled?.status).toBe("cancelled");
+    expect(mockTerminateLocalService).toHaveBeenCalledWith(
+      expect.objectContaining({ pid: 12345, processGroupId: null }),
+      { forceAfterMs: 1000 },
+    );
+    expect(runningProcesses.has(runId)).toBe(false);
   });
 
   it("records manual cancellation stop metadata", async () => {
