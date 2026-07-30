@@ -7660,15 +7660,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return updated;
   }
 
-  async function setRunStatusIfRunning(
+  async function setRunStatusIfCurrentStatusIn(
     runId: string,
+    currentStatuses: readonly string[],
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
     const updated = await db
       .update(heartbeatRuns)
       .set({ status, ...patch, updatedAt: new Date() })
-      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
+      .where(and(eq(heartbeatRuns.id, runId), inArray(heartbeatRuns.status, [...currentStatuses])))
       .returning()
       .then((rows) => rows[0] ?? null);
 
@@ -9155,7 +9156,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const message = `Interrupted by graceful server shutdown (${signal}); retry queued for restart recovery`;
-      const interruptedStatus = await setRunStatusIfRunning(run.id, "interrupted", {
+      const interruptedStatus = await setRunStatusIfCurrentStatusIn(run.id, ["running"], "interrupted", {
         finishedAt: now,
         error: message,
         errorCode: "server_shutdown_interrupted",
@@ -13934,7 +13935,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterResult.summary ?? null,
       );
 
-      const persistedRunWrite = await setRunStatusIfRunning(run.id, status, {
+      const persistedRunWrite = await setRunStatusIfCurrentStatusIn(run.id, ["running"], status, {
         finishedAt: new Date(),
         error: runErrorMessage,
         errorCode: runErrorCode,
@@ -14156,7 +14157,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logger.warn({ err: flushErr, runId }, "failed to flush run output progress after error");
       });
 
-      const failedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
+      const failedRunWrite = await setRunStatusIfCurrentStatusIn(run.id, ["running"], "failed", {
         error: message,
         errorCode: failureErrorCode,
         finishedAt: new Date(),
@@ -14268,7 +14269,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             "setup_failed";
           logger.error({ err: outerErr, runId }, "heartbeat execution setup failed");
           const setupFailureAgent = await getAgent(run.agentId).catch(() => null);
-          const setupFailureWrite = await setRunStatusIfRunning(runId, "failed", {
+          const setupFailureWrite = await setRunStatusIfCurrentStatusIn(runId, ["running"], "failed", {
             error: message,
             errorCode: setupFailureErrorCode,
             finishedAt: new Date(),
@@ -16605,6 +16606,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       : options.resultJson;
 
+    const cancellationWrite = await setRunStatusIfCurrentStatusIn(
+      run.id,
+      CANCELLABLE_HEARTBEAT_RUN_STATUSES,
+      "cancelled",
+      {
+        finishedAt: new Date(),
+        error: reason,
+        errorCode,
+        ...(resultJson ? { resultJson } : {}),
+      },
+    );
+    if (!cancellationWrite.updated) return cancellationWrite.run;
+    const cancelled = cancellationWrite.run;
+
+    await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+      finishedAt: cancelled.finishedAt ?? new Date(),
+      error: reason,
+    });
+
     const running = runningProcesses.get(run.id);
     try {
       if (running) {
@@ -16623,21 +16643,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       runningProcesses.delete(run.id);
     }
 
-    const finishedAt = new Date();
-    const cancelled = await setRunStatus(run.id, "cancelled", {
-      finishedAt,
-      error: reason,
-      errorCode,
-      ...(resultJson ? { resultJson } : {}),
-    });
-
-    await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-      finishedAt,
-      error: reason,
-    });
-
     if (cancelled) {
-      await appendRunEvent(cancelled, 1, {
+      await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
