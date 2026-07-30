@@ -13207,10 +13207,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           contextSnapshot: context,
           updatedAt: new Date(),
         })
-        .where(eq(heartbeatRuns.id, run.id))
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
         .returning()
         .then((rows) => rows[0] ?? null);
-      if (runningWithSession) run = runningWithSession;
+      if (!runningWithSession) {
+        logger.info(
+          { runId: run.id },
+          "skipping execution start because the run already left running state",
+        );
+        return;
+      }
+      run = runningWithSession;
 
       // Pause Durability: flip to "running" ONLY if the agent is still invokable.
       // Atomic conditional UPDATE is the sole gate (no read-then-write); 0 rows => abort.
