@@ -1042,6 +1042,73 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["checkout", { checkoutRunId: "run-1", executionRunId: null }],
+    ["execution", { checkoutRunId: null, executionRunId: "run-1" }],
+  ])("allows the assigned task-bridge agent to write metadata for its %s run", async (_lock, runFields) => {
+    const metadata = {
+      version: 1,
+      sections: [{ rows: [{ type: "key_value", label: "Result", value: "Bridge completed" }] }],
+    };
+    mockIssueService.getById.mockResolvedValue({
+      ...makeIssue("todo"),
+      originKind: "task_bridge",
+      ...runFields,
+    });
+
+    const res = await request(await installActor(createApp(), agentActor()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Bridge result", metadata });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      "Bridge result",
+      { agentId: "22222222-2222-4222-8222-222222222222", userId: undefined, runId: "run-1" },
+      expect.objectContaining({ authorType: "agent", metadata }),
+    );
+  });
+
+  it("keeps presentation board-only for an assigned task-bridge agent", async () => {
+    mockIssueService.getById.mockResolvedValue({
+      ...makeIssue("todo"),
+      originKind: "task_bridge",
+      checkoutRunId: "run-1",
+    });
+
+    const res = await request(await installActor(createApp(), agentActor()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Bridge result", presentation: { kind: "system_notice", tone: "warning" } });
+
+    expect(res.status).toBe(403);
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a mismatched run", agentActor(), { checkoutRunId: "another-run" }],
+    ["a missing run", { ...agentActor(), runId: undefined }, { checkoutRunId: "run-1" }],
+    ["a different assignee", agentActor(), { assigneeAgentId: "44444444-4444-4444-8444-444444444444", checkoutRunId: "run-1" }],
+  ])("rejects task-bridge metadata from %s", async (_caseName, actor, issueFields) => {
+    mockIssueService.getById.mockResolvedValue({
+      ...makeIssue("todo"),
+      originKind: "task_bridge",
+      ...issueFields,
+    });
+
+    const res = await request(await installActor(createApp(), actor))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({
+        body: "Bridge result",
+        metadata: {
+          version: 1,
+          sections: [{ rows: [{ type: "key_value", label: "Result", value: "Denied" }] }],
+        },
+      });
+
+    expect(res.status).toBe(403);
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
   it("rejects invalid comment metadata before writing a comment", async () => {
     const app = await installActor(createApp());
     mockIssueService.getById.mockResolvedValue(makeIssue("todo"));

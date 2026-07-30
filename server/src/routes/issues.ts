@@ -4155,10 +4155,26 @@ export function issueRoutes(
     req: Request,
     res: Response,
     input: { presentation?: unknown; metadata?: unknown },
+    issue: {
+      originKind?: string | null;
+      assigneeAgentId: string | null;
+      checkoutRunId?: string | null;
+      executionRunId?: string | null;
+    },
   ) {
     const hasStructuredFields = input.presentation !== undefined || input.metadata !== undefined;
     if (!hasStructuredFields) return true;
     if (req.actor.type === "board") return true;
+    const runId = req.actor.type === "agent" ? req.actor.runId?.trim() : null;
+    if (
+      req.actor.type === "agent" &&
+      input.presentation === undefined &&
+      input.metadata !== undefined &&
+      issue.originKind === "task_bridge" &&
+      issue.assigneeAgentId === req.actor.agentId &&
+      runId &&
+      (runId === issue.checkoutRunId || runId === issue.executionRunId)
+    ) return true;
     res.status(403).json({
       error: "Only board users may set structured comment presentation or metadata",
       details: {
@@ -9974,7 +9990,7 @@ export function issueRoutes(
     if (!assertStructuredCommentFieldsAllowed(req, res, {
       presentation: req.body.presentation,
       metadata: req.body.metadata,
-    })) return;
+    }, issue)) return;
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(issue);
     if (closedExecutionWorkspace) {
       respondClosedIssueExecutionWorkspace(res, closedExecutionWorkspace);
