@@ -431,47 +431,167 @@ export function companyService(db: Db) {
 
     remove: (id: string) =>
       db.transaction(async (tx) => {
-        // Delete from child tables in dependency order
-        const companyRunIds = await tx
-          .select({ id: heartbeatRuns.id })
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.companyId, id));
+        const lockedCompanyRows = Array.from(await tx.execute<{ id: string }>(sql`
+          SELECT ${companies.id} AS id
+          FROM ${companies}
+          WHERE ${companies.id} = ${id}
+          FOR UPDATE
+        `));
+        if (lockedCompanyRows.length === 0) return null;
 
-        await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.companyId, id));
-        if (companyRunIds.length > 0) {
-          await tx
-            .delete(heartbeatRunEvents)
-            .where(inArray(heartbeatRunEvents.runId, companyRunIds.map((run) => run.id)));
+        type CompanyOwnedTableRow = {
+          schemaName: string;
+          tableName: string;
+          companyIdColumn: string;
+        };
+        type BlockingForeignKeyRow = {
+          constraintName: string;
+          childSchemaName: string;
+          childTableName: string;
+          parentSchemaName: string;
+          parentTableName: string;
+        };
+
+        const ownedTables = Array.from(await tx.execute<CompanyOwnedTableRow>(sql`
+          SELECT DISTINCT
+            child_namespace.nspname AS "schemaName",
+            child.relname AS "tableName",
+            child_column.attname AS "companyIdColumn"
+          FROM pg_constraint foreign_key
+          JOIN pg_class child ON child.oid = foreign_key.conrelid
+          JOIN pg_namespace child_namespace ON child_namespace.oid = child.relnamespace
+          JOIN pg_class parent ON parent.oid = foreign_key.confrelid
+          JOIN pg_namespace parent_namespace ON parent_namespace.oid = parent.relnamespace
+          JOIN LATERAL unnest(foreign_key.conkey) WITH ORDINALITY
+            AS child_key(attnum, ordinal) ON true
+          JOIN LATERAL unnest(foreign_key.confkey) WITH ORDINALITY
+            AS parent_key(attnum, ordinal) ON parent_key.ordinal = child_key.ordinal
+          JOIN pg_attribute child_column
+            ON child_column.attrelid = child.oid
+            AND child_column.attnum = child_key.attnum
+          JOIN pg_attribute parent_column
+            ON parent_column.attrelid = parent.oid
+            AND parent_column.attnum = parent_key.attnum
+          WHERE foreign_key.contype = 'f'
+            AND parent_namespace.nspname = 'public'
+            AND parent.relname = 'companies'
+            AND parent_column.attname = 'id'
+            AND child_column.attname = 'company_id'
+          ORDER BY child_namespace.nspname, child.relname
+        `));
+
+        const blockingForeignKeys = Array.from(await tx.execute<BlockingForeignKeyRow>(sql`
+          WITH company_owned_tables AS (
+            SELECT DISTINCT child.oid
+            FROM pg_constraint company_foreign_key
+            JOIN pg_class child ON child.oid = company_foreign_key.conrelid
+            JOIN pg_class company_table ON company_table.oid = company_foreign_key.confrelid
+            JOIN pg_namespace company_namespace ON company_namespace.oid = company_table.relnamespace
+            JOIN LATERAL unnest(company_foreign_key.conkey) WITH ORDINALITY
+              AS child_key(attnum, ordinal) ON true
+            JOIN LATERAL unnest(company_foreign_key.confkey) WITH ORDINALITY
+              AS parent_key(attnum, ordinal) ON parent_key.ordinal = child_key.ordinal
+            JOIN pg_attribute child_column
+              ON child_column.attrelid = child.oid
+              AND child_column.attnum = child_key.attnum
+            JOIN pg_attribute parent_column
+              ON parent_column.attrelid = company_table.oid
+              AND parent_column.attnum = parent_key.attnum
+            WHERE company_foreign_key.contype = 'f'
+              AND company_namespace.nspname = 'public'
+              AND company_table.relname = 'companies'
+              AND parent_column.attname = 'id'
+              AND child_column.attname = 'company_id'
+          )
+          SELECT DISTINCT
+            foreign_key.conname AS "constraintName",
+            child_namespace.nspname AS "childSchemaName",
+            child.relname AS "childTableName",
+            parent_namespace.nspname AS "parentSchemaName",
+            parent.relname AS "parentTableName"
+          FROM pg_constraint foreign_key
+          JOIN pg_class child ON child.oid = foreign_key.conrelid
+          JOIN pg_namespace child_namespace ON child_namespace.oid = child.relnamespace
+          JOIN pg_class parent ON parent.oid = foreign_key.confrelid
+          JOIN pg_namespace parent_namespace ON parent_namespace.oid = parent.relnamespace
+          JOIN company_owned_tables owned_parent ON owned_parent.oid = parent.oid
+          WHERE foreign_key.contype = 'f'
+            AND foreign_key.confdeltype IN ('a', 'r')
+          ORDER BY child_namespace.nspname, child.relname, foreign_key.conname
+        `));
+
+        const tableKey = (schemaName: string, tableName: string) => `${schemaName}\u0000${tableName}`;
+        const ownedTableByKey = new Map(
+          ownedTables.map((table) => [tableKey(table.schemaName, table.tableName), table]),
+        );
+        const outgoingParents = new Map<string, Set<string>>();
+        const incomingEdgeCount = new Map(
+          ownedTables.map((table) => [tableKey(table.schemaName, table.tableName), 0]),
+        );
+
+        for (const foreignKey of blockingForeignKeys) {
+          const childKey = tableKey(foreignKey.childSchemaName, foreignKey.childTableName);
+          const parentKey = tableKey(foreignKey.parentSchemaName, foreignKey.parentTableName);
+          if (!ownedTableByKey.has(childKey)) {
+            throw new Error(
+              `Cannot delete company: ${foreignKey.constraintName} references a company-owned table ` +
+              `from non-company-owned table ${foreignKey.childSchemaName}.${foreignKey.childTableName}`,
+            );
+          }
+          if (childKey === parentKey) {
+            // A single table-wide DELETE removes same-company self-references together.
+            // Any surviving cross-company reference still raises 23503 and rolls back this transaction.
+            continue;
+          }
+          const parents = outgoingParents.get(childKey) ?? new Set<string>();
+          if (!parents.has(parentKey)) {
+            parents.add(parentKey);
+            outgoingParents.set(childKey, parents);
+            incomingEdgeCount.set(parentKey, (incomingEdgeCount.get(parentKey) ?? 0) + 1);
+          }
         }
-        await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.companyId, id));
-        await tx.delete(activityLog).where(eq(activityLog.companyId, id));
-        await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, id));
-        await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, id));
-        await tx.delete(agentApiKeys).where(eq(agentApiKeys.companyId, id));
-        await tx.delete(agentRuntimeState).where(eq(agentRuntimeState.companyId, id));
-        await tx.delete(issueComments).where(eq(issueComments.companyId, id));
-        await tx.delete(costEvents).where(eq(costEvents.companyId, id));
-        await tx.delete(financeEvents).where(eq(financeEvents.companyId, id));
-        await tx.delete(approvalComments).where(eq(approvalComments.companyId, id));
-        await tx.delete(approvals).where(eq(approvals.companyId, id));
-        await tx.delete(companySecrets).where(eq(companySecrets.companyId, id));
-        await tx.delete(joinRequests).where(eq(joinRequests.companyId, id));
-        await tx.delete(invites).where(eq(invites.companyId, id));
-        await tx.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, id));
-        await tx.delete(companyMemberships).where(eq(companyMemberships.companyId, id));
-        await tx.delete(companySkills).where(eq(companySkills.companyId, id));
-        await tx.delete(routineRuns).where(eq(routineRuns.companyId, id));
-        await tx.delete(routineTriggers).where(eq(routineTriggers.companyId, id));
-        await tx.delete(routineRevisions).where(eq(routineRevisions.companyId, id));
-        await tx.delete(routines).where(eq(routines.companyId, id));
-        await tx.delete(issueReadStates).where(eq(issueReadStates.companyId, id));
-        await tx.delete(documents).where(eq(documents.companyId, id));
-        await tx.delete(issues).where(eq(issues.companyId, id));
-        await tx.delete(companyLogos).where(eq(companyLogos.companyId, id));
-        await tx.delete(assets).where(eq(assets.companyId, id));
-        await tx.delete(goals).where(eq(goals.companyId, id));
-        await tx.delete(projects).where(eq(projects.companyId, id));
-        await tx.delete(agents).where(eq(agents.companyId, id));
+
+        const ready = Array.from(incomingEdgeCount.entries())
+          .filter(([, count]) => count === 0)
+          .map(([key]) => key)
+          .sort();
+        const deletionOrder: CompanyOwnedTableRow[] = [];
+
+        while (ready.length > 0) {
+          const key = ready.shift()!;
+          deletionOrder.push(ownedTableByKey.get(key)!);
+          for (const parentKey of Array.from(outgoingParents.get(key) ?? []).sort()) {
+            const nextCount = (incomingEdgeCount.get(parentKey) ?? 0) - 1;
+            incomingEdgeCount.set(parentKey, nextCount);
+            if (nextCount === 0) {
+              ready.push(parentKey);
+              ready.sort();
+            }
+          }
+        }
+
+        if (deletionOrder.length !== ownedTables.length) {
+          const cycleTables = Array.from(incomingEdgeCount.entries())
+            .filter(([, count]) => count > 0)
+            .map(([key]) => {
+              const table = ownedTableByKey.get(key)!;
+              return `${table.schemaName}.${table.tableName}`;
+            })
+            .sort();
+          throw new Error(
+            `Cannot delete company: non-cascading foreign key cycle among ${cycleTables.join(', ')}`,
+          );
+        }
+
+        const quoteIdentifier = (value: string) => `"${value.replaceAll('"', '""')}"`;
+        for (const table of deletionOrder) {
+          const tableIdentifier = sql.raw(
+            `${quoteIdentifier(table.schemaName)}.${quoteIdentifier(table.tableName)}`,
+          );
+          const companyIdColumn = sql.raw(quoteIdentifier(table.companyIdColumn));
+          await tx.execute(sql`DELETE FROM ${tableIdentifier} WHERE ${companyIdColumn} = ${id}`);
+        }
+
         const rows = await tx
           .delete(companies)
           .where(eq(companies.id, id))

@@ -1,20 +1,26 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agentConfigRevisions,
   agents,
   agentWakeupRequests,
+  budgetIncidents,
+  budgetPolicies,
   builtInManagedResources,
   companies,
   companySkillVersions,
   companySkills,
   companyMemberships,
+  costEvents,
   createDb,
+  financeEvents,
+  goals,
   heartbeatRunEvents,
   heartbeatRuns,
   principalPermissionGrants,
+  projects,
   routines,
   routineTriggers,
 } from "@paperclipai/db";
@@ -50,11 +56,17 @@ describeEmbeddedPostgres("companyService", () => {
     await db.delete(builtInManagedResources);
     await db.delete(companySkillVersions);
     await db.delete(companySkills);
+    await db.delete(financeEvents);
+    await db.delete(costEvents);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentConfigRevisions);
     await db.delete(activityLog);
+    await db.delete(budgetIncidents);
+    await db.delete(budgetPolicies);
+    await db.delete(projects);
+    await db.delete(goals);
     await db.delete(agents);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
@@ -79,6 +91,440 @@ describeEmbeddedPostgres("companyService", () => {
 
     const rows = await db.select({ issuePrefix: companies.issuePrefix }).from(companies);
     expect(rows.map((row) => row.issuePrefix).sort()).toEqual(["ARO", "AROA"]);
+  });
+
+  it("removes a populated company in foreign-key-safe order without touching another company", async () => {
+    const now = new Date("2026-07-30T00:00:00Z");
+
+    const createPopulatedCompany = async (
+      companyId: string,
+      issuePrefix: string,
+      status: "active" | "archived",
+    ) => {
+      const managerAgentId = randomUUID();
+      const workerAgentId = randomUUID();
+      const parentGoalId = randomUUID();
+      const goalId = randomUUID();
+      const projectId = randomUUID();
+      const runId = randomUUID();
+      const costEventId = randomUUID();
+      const budgetPolicyId = randomUUID();
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: `${issuePrefix} Company`,
+        status,
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+      });
+
+      await db.insert(agents).values({
+        id: managerAgentId,
+        companyId,
+        name: `${issuePrefix} Manager`,
+        role: "manager",
+        status: "terminated",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(agents).values({
+        id: workerAgentId,
+        companyId,
+        name: `${issuePrefix} Worker`,
+        role: "engineer",
+        status: "terminated",
+        reportsTo: managerAgentId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      await db.insert(goals).values({
+        id: parentGoalId,
+        companyId,
+        title: `${issuePrefix} Parent Goal`,
+        ownerAgentId: managerAgentId,
+      });
+      await db.insert(goals).values({
+        id: goalId,
+        companyId,
+        title: `${issuePrefix} Child Goal`,
+        parentId: parentGoalId,
+        ownerAgentId: workerAgentId,
+      });
+
+      await db.insert(projects).values({
+        id: projectId,
+        companyId,
+        goalId,
+        leadAgentId: workerAgentId,
+        name: `${issuePrefix} Project`,
+      });
+
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId: workerAgentId,
+        invocationSource: "on_demand",
+        status: "succeeded",
+        startedAt: now,
+        finishedAt: now,
+      });
+
+      await db.insert(heartbeatRunEvents).values({
+        companyId,
+        runId,
+        agentId: workerAgentId,
+        seq: 1,
+        eventType: "lifecycle",
+        message: "completed",
+      });
+
+      await db.insert(costEvents).values({
+        id: costEventId,
+        companyId,
+        agentId: workerAgentId,
+        projectId,
+        goalId,
+        heartbeatRunId: runId,
+        provider: "test",
+        biller: "test",
+        billingType: "test",
+        costStatus: "reported",
+        model: "test-model",
+        costCents: 1,
+        occurredAt: now,
+      });
+
+      await db.insert(financeEvents).values({
+        companyId,
+        agentId: workerAgentId,
+        projectId,
+        goalId,
+        heartbeatRunId: runId,
+        costEventId,
+        eventKind: "agent_cost",
+        biller: "test",
+        amountCents: 1,
+        occurredAt: now,
+      });
+
+      await db.insert(budgetPolicies).values({
+        id: budgetPolicyId,
+        companyId,
+        scopeType: "company",
+        scopeId: companyId,
+        windowKind: "monthly",
+        amount: 100,
+      });
+
+      await db.insert(budgetIncidents).values({
+        companyId,
+        policyId: budgetPolicyId,
+        scopeType: "company",
+        scopeId: companyId,
+        metric: "billed_cents",
+        windowKind: "monthly",
+        windowStart: now,
+        windowEnd: new Date("2026-08-01T00:00:00Z"),
+        thresholdType: "hard_stop",
+        amountLimit: 100,
+        amountObserved: 101,
+      });
+    };
+
+    type CompanyRowCounts = {
+      companyCount: number;
+      agentCount: number;
+      goalCount: number;
+      projectCount: number;
+      heartbeatRunCount: number;
+      heartbeatEventCount: number;
+      costEventCount: number;
+      financeEventCount: number;
+      budgetPolicyCount: number;
+      budgetIncidentCount: number;
+    };
+    const readCompanyRowCounts = async (companyId: string) => {
+      const rows = Array.from(await db.execute<CompanyRowCounts>(sql`
+        SELECT
+          (SELECT count(*)::int FROM companies WHERE id = ${companyId}) AS "companyCount",
+          (SELECT count(*)::int FROM agents WHERE company_id = ${companyId}) AS "agentCount",
+          (SELECT count(*)::int FROM goals WHERE company_id = ${companyId}) AS "goalCount",
+          (SELECT count(*)::int FROM projects WHERE company_id = ${companyId}) AS "projectCount",
+          (SELECT count(*)::int FROM heartbeat_runs WHERE company_id = ${companyId}) AS "heartbeatRunCount",
+          (SELECT count(*)::int FROM heartbeat_run_events WHERE company_id = ${companyId}) AS "heartbeatEventCount",
+          (SELECT count(*)::int FROM cost_events WHERE company_id = ${companyId}) AS "costEventCount",
+          (SELECT count(*)::int FROM finance_events WHERE company_id = ${companyId}) AS "financeEventCount",
+          (SELECT count(*)::int FROM budget_policies WHERE company_id = ${companyId}) AS "budgetPolicyCount",
+          (SELECT count(*)::int FROM budget_incidents WHERE company_id = ${companyId}) AS "budgetIncidentCount"
+      `));
+      return rows[0]!;
+    };
+
+    const targetCompanyId = randomUUID();
+    const controlCompanyId = randomUUID();
+    await createPopulatedCompany(targetCompanyId, "TARG", "archived");
+    await createPopulatedCompany(controlCompanyId, "CTRL", "active");
+
+    const removed = await companyService(db).remove(targetCompanyId);
+
+    expect(removed?.id).toBe(targetCompanyId);
+    expect(await readCompanyRowCounts(targetCompanyId)).toEqual({
+      companyCount: 0,
+      agentCount: 0,
+      goalCount: 0,
+      projectCount: 0,
+      heartbeatRunCount: 0,
+      heartbeatEventCount: 0,
+      costEventCount: 0,
+      financeEventCount: 0,
+      budgetPolicyCount: 0,
+      budgetIncidentCount: 0,
+    });
+    expect(await readCompanyRowCounts(controlCompanyId)).toEqual({
+      companyCount: 1,
+      agentCount: 2,
+      goalCount: 2,
+      projectCount: 1,
+      heartbeatRunCount: 1,
+      heartbeatEventCount: 1,
+      costEventCount: 1,
+      financeEventCount: 1,
+      budgetPolicyCount: 1,
+      budgetIncidentCount: 1,
+    });
+  });
+
+  it("rolls back when another company references a target-company agent", async () => {
+    const targetCompanyId = randomUUID();
+    const controlCompanyId = randomUUID();
+    const targetAgentId = randomUUID();
+    const controlAgentId = randomUUID();
+
+    await db.insert(companies).values([
+      {
+        id: targetCompanyId,
+        name: "Cross Company Target",
+        status: "archived",
+        issuePrefix: "XCT",
+        requireBoardApprovalForNewAgents: false,
+      },
+      {
+        id: controlCompanyId,
+        name: "Cross Company Control",
+        status: "active",
+        issuePrefix: "XCC",
+        requireBoardApprovalForNewAgents: false,
+      },
+    ]);
+    await db.insert(agents).values({
+      id: targetAgentId,
+      companyId: targetCompanyId,
+      name: "Target Manager",
+      role: "manager",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(agents).values({
+      id: controlAgentId,
+      companyId: controlCompanyId,
+      name: "Control Worker",
+      role: "engineer",
+      status: "terminated",
+      reportsTo: targetAgentId,
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await expect(companyService(db).remove(targetCompanyId)).rejects.toThrow();
+
+    const companyRows = await db
+      .select({ id: companies.id })
+      .from(companies)
+      .where(eq(companies.id, targetCompanyId));
+    const targetAgentRows = await db
+      .select({ id: agents.id })
+      .from(agents)
+      .where(eq(agents.id, targetAgentId));
+    const controlAgentRows = await db
+      .select({ id: agents.id })
+      .from(agents)
+      .where(eq(agents.id, controlAgentId));
+    expect(companyRows).toHaveLength(1);
+    expect(targetAgentRows).toHaveLength(1);
+    expect(controlAgentRows).toHaveLength(1);
+  });
+
+  it("rejects a non-company-owned table that blocks a company-owned table", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const externalReferenceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "External Blocker Target",
+      status: "archived",
+      issuePrefix: "EBT",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Externally Referenced Agent",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.execute(sql`
+      CREATE TABLE company_delete_external_agent_refs (
+        id uuid PRIMARY KEY,
+        agent_id uuid NOT NULL REFERENCES agents(id)
+      )
+    `);
+
+    try {
+      await db.execute(sql`
+        INSERT INTO company_delete_external_agent_refs (id, agent_id)
+        VALUES (${externalReferenceId}, ${agentId})
+      `);
+
+      await expect(companyService(db).remove(companyId)).rejects.toThrow(
+        /non-company-owned table public\.company_delete_external_agent_refs/,
+      );
+
+      const companyRows = await db
+        .select({ id: companies.id })
+        .from(companies)
+        .where(eq(companies.id, companyId));
+      const agentRows = await db
+        .select({ id: agents.id })
+        .from(agents)
+        .where(eq(agents.id, agentId));
+      const externalRows = Array.from(await db.execute<{ count: number }>(sql`
+        SELECT count(*)::int AS count FROM company_delete_external_agent_refs
+      `));
+      expect(companyRows).toHaveLength(1);
+      expect(agentRows).toHaveLength(1);
+      expect(externalRows[0]?.count).toBe(1);
+    } finally {
+      await db.execute(sql`DROP TABLE IF EXISTS company_delete_external_agent_refs`);
+    }
+  });
+
+  it("rejects a non-cascading cycle between company-owned tables", async () => {
+    const companyId = randomUUID();
+    const leftId = randomUUID();
+    const rightId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Cycle Target",
+      status: "archived",
+      issuePrefix: "CYT",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.execute(sql`
+      CREATE TABLE company_delete_cycle_left (
+        id uuid PRIMARY KEY,
+        company_id uuid NOT NULL REFERENCES companies(id),
+        right_id uuid
+      )
+    `);
+    await db.execute(sql`
+      CREATE TABLE company_delete_cycle_right (
+        id uuid PRIMARY KEY,
+        company_id uuid NOT NULL REFERENCES companies(id),
+        left_id uuid REFERENCES company_delete_cycle_left(id)
+      )
+    `);
+    await db.execute(sql`
+      ALTER TABLE company_delete_cycle_left
+      ADD CONSTRAINT company_delete_cycle_left_right_fk
+      FOREIGN KEY (right_id) REFERENCES company_delete_cycle_right(id)
+    `);
+
+    try {
+      await db.execute(sql`
+        INSERT INTO company_delete_cycle_left (id, company_id)
+        VALUES (${leftId}, ${companyId})
+      `);
+      await db.execute(sql`
+        INSERT INTO company_delete_cycle_right (id, company_id, left_id)
+        VALUES (${rightId}, ${companyId}, ${leftId})
+      `);
+      await db.execute(sql`
+        UPDATE company_delete_cycle_left SET right_id = ${rightId} WHERE id = ${leftId}
+      `);
+
+      await expect(companyService(db).remove(companyId)).rejects.toThrow(
+        /non-cascading foreign key cycle/,
+      );
+
+      const companyRows = await db
+        .select({ id: companies.id })
+        .from(companies)
+        .where(eq(companies.id, companyId));
+      const cycleRows = Array.from(await db.execute<{ leftCount: number; rightCount: number }>(sql`
+        SELECT
+          (SELECT count(*)::int FROM company_delete_cycle_left) AS "leftCount",
+          (SELECT count(*)::int FROM company_delete_cycle_right) AS "rightCount"
+      `));
+      expect(companyRows).toHaveLength(1);
+      expect(cycleRows[0]).toEqual({ leftCount: 1, rightCount: 1 });
+    } finally {
+      await db.execute(sql`
+        DROP TABLE IF EXISTS company_delete_cycle_left, company_delete_cycle_right CASCADE
+      `);
+    }
+  });
+
+  it("discovers and safely quotes a newly added company-owned table", async () => {
+    const companyId = randomUUID();
+    const oddRowId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Quoted Identifier Target",
+      status: "archived",
+      issuePrefix: "QIT",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.execute(sql`
+      CREATE TABLE "company_delete_odd.rows" (
+        id uuid PRIMARY KEY,
+        company_id uuid NOT NULL REFERENCES companies(id),
+        payload text NOT NULL
+      )
+    `);
+
+    try {
+      await db.execute(sql`
+        INSERT INTO "company_delete_odd.rows" (id, company_id, payload)
+        VALUES (${oddRowId}, ${companyId}, 'quoted')
+      `);
+
+      const removed = await companyService(db).remove(companyId);
+
+      const oddRows = Array.from(await db.execute<{ count: number }>(sql`
+        SELECT count(*)::int AS count FROM "company_delete_odd.rows"
+      `));
+      expect(removed?.id).toBe(companyId);
+      expect(oddRows[0]?.count).toBe(0);
+    } finally {
+      await db.execute(sql`DROP TABLE IF EXISTS "company_delete_odd.rows"`);
+    }
   });
 
   it("auto-provisions one paused Reflection Coach bundle for a freshly created company", async () => {
