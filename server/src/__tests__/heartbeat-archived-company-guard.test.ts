@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  activityLog,
   agents,
   agentWakeupRequests,
   companies,
@@ -34,6 +36,7 @@ describeEmbeddedPostgres("heartbeat archived-company guard", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
@@ -77,6 +80,18 @@ describeEmbeddedPostgres("heartbeat archived-company guard", () => {
     });
 
     return { companyId, agentId };
+  }
+
+  async function insertAssignedTodo(companyId: string, agentId: string) {
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Archived assigned todo",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    return issueId;
   }
 
   async function insertInvalidOrgChainAgent() {
@@ -150,6 +165,102 @@ describeEmbeddedPostgres("heartbeat archived-company guard", () => {
       .from(heartbeatRuns)
       .then((rows) => rows.filter((row) => row.agentId === agentId).length);
     expect(runCount).toBe(0);
+  });
+
+  it("excludes archived assigned todo issues before liveness reconciliation writes", async () => {
+    const { companyId, agentId } = await insertArchivedAgent();
+    const issueId = await insertAssignedTodo(companyId, agentId);
+    const issueBefore = await db
+      .select()
+      .from(issues)
+      .then((rows) => rows.find((row) => row.id === issueId) ?? null);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({
+      assignmentDispatched: 0,
+      dispatchRequeued: 0,
+      continuationRequeued: 0,
+      reviewParticipantRequeued: 0,
+      escalated: 0,
+      skipped: 0,
+      issueIds: [],
+    });
+
+    const [issueAfter, wakeups, runs, runEvents, activities] = await Promise.all([
+      db.select().from(issues).then((rows) => rows.find((row) => row.id === issueId) ?? null),
+      db.select().from(agentWakeupRequests),
+      db.select().from(heartbeatRuns),
+      db.select().from(heartbeatRunEvents),
+      db.select().from(activityLog),
+    ]);
+
+    expect(issueAfter).toEqual(issueBefore);
+    expect(wakeups).toHaveLength(0);
+    expect(
+      wakeups.some((row) =>
+        (row.payload as Record<string, unknown> | null)?.mutation === "assigned_todo_liveness_dispatch"),
+    ).toBe(false);
+    expect(runs).toHaveLength(0);
+    expect(runEvents).toHaveLength(0);
+    expect(activities).toHaveLength(0);
+  });
+
+  it("does not compete with archived-company agent deletion during liveness reconciliation", async () => {
+    const { companyId, agentId } = await insertArchivedAgent();
+    await insertAssignedTodo(companyId, agentId);
+
+    let markDeletionLockHeld!: () => void;
+    let releaseDeletion!: () => void;
+    const deletionLockHeld = new Promise<void>((resolve) => {
+      markDeletionLockHeld = resolve;
+    });
+    const holdDeletion = new Promise<void>((resolve) => {
+      releaseDeletion = resolve;
+    });
+    const deletion = db.transaction(async (tx) => {
+      await tx.delete(issues).where(eq(issues.companyId, companyId));
+      await tx.delete(agents).where(eq(agents.companyId, companyId));
+      markDeletionLockHeld();
+      await holdDeletion;
+    });
+
+    await deletionLockHeld;
+
+    const heartbeat = heartbeatService(db);
+    const reconciliation = heartbeat.reconcileStrandedAssignedIssues().then(
+      (value) => ({ status: "fulfilled" as const, value }),
+      (error: unknown) => ({ status: "rejected" as const, error }),
+    );
+    let completedBeforeDeletionCommit = false;
+    let wakeupsWhileDeletionOpen: Array<typeof agentWakeupRequests.$inferSelect> = [];
+
+    try {
+      const outcomeBeforeDeletionCommit = await Promise.race([
+        reconciliation,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 1_000)),
+      ]);
+      completedBeforeDeletionCommit = outcomeBeforeDeletionCommit !== null;
+      wakeupsWhileDeletionOpen = await db.select().from(agentWakeupRequests);
+    } finally {
+      releaseDeletion();
+      await deletion;
+    }
+
+    const outcome = await reconciliation;
+    expect(completedBeforeDeletionCommit).toBe(true);
+    if (outcome.status === "rejected") throw outcome.error;
+    expect(outcome.value).toMatchObject({
+      assignmentDispatched: 0,
+      dispatchRequeued: 0,
+      continuationRequeued: 0,
+      escalated: 0,
+      skipped: 0,
+      issueIds: [],
+    });
+    expect(wakeupsWhileDeletionOpen).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
   });
 
   it("skips background wakeups for non-active companies with a company.inactive reason", async () => {

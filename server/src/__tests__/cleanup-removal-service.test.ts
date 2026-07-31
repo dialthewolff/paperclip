@@ -233,7 +233,7 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await expect(db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).resolves.toHaveLength(0);
   });
 
-  it("removes heartbeat events by run id before deleting company-owned runs", async () => {
+  it("fails closed when another company's heartbeat event references a company-owned run", async () => {
     const { agentId, companyId, runId } = await seedFixture();
     const otherCompanyId = randomUUID();
 
@@ -253,11 +253,11 @@ describeEmbeddedPostgres("cleanup removal services", () => {
       message: "event with mismatched company scope",
     });
 
-    const removed = await companyService(db).remove(companyId);
+    await expect(companyService(db).remove(companyId)).rejects.toThrow();
 
-    expect(removed?.id).toBe(companyId);
-    await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(0);
-    await expect(db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).resolves.toHaveLength(0);
+    await expect(db.select().from(companies).where(eq(companies.id, companyId))).resolves.toHaveLength(1);
+    await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(1);
+    await expect(db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).resolves.toHaveLength(1);
     await expect(db.select().from(companies).where(eq(companies.id, otherCompanyId))).resolves.toHaveLength(1);
   });
 

@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -1094,8 +1094,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       })
       .from(issueRelations)
       .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+      .innerJoin(companies, eq(companies.id, issues.companyId))
       .where(
         and(
+          eq(companies.status, "active"),
           eq(issueRelations.type, "blocks"),
           inArray(issues.status, ["todo", "blocked"]),
           isNull(issues.assigneeAgentId),
@@ -3464,10 +3466,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
   async function reconcileStrandedAssignedIssues(opts?: { issueCreatedAtGte?: Date | null }) {
     const candidates = await db
-      .select()
+      .select({ ...getTableColumns(issues) })
       .from(issues)
+      .innerJoin(companies, eq(companies.id, issues.companyId))
       .where(
         and(
+          eq(companies.status, "active"),
           isNull(issues.assigneeUserId),
           inArray(issues.status, ["todo", "in_progress", "in_review"]),
           or(
