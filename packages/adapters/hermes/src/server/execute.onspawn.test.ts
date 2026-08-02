@@ -137,6 +137,18 @@ describe("hermes-local adapter onSpawn forwarding", () => {
     }
   });
 
+  it("uses the Paperclip-provisioned workspace before the adapter cwd", async () => {
+    const { ctx } = makeCtx({ cwd: "/workspace/shared-checkout" });
+    (ctx.context as Record<string, unknown>).paperclipWorkspace = {
+      cwd: "/paperclip/worktrees/wolff-law-ops/paperclip-WOL-26",
+    };
+
+    await execute(ctx as any);
+
+    const lastCall = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
+    expect(lastCall[3]?.cwd).toBe("/paperclip/worktrees/wolff-law-ops/paperclip-WOL-26");
+  });
+
   it("uses an explicit callback URL for both the child environment and prompt", async () => {
     const previousRuntimeUrl = process.env.PAPERCLIP_RUNTIME_API_URL;
     const previousPublicUrl = process.env.PAPERCLIP_PUBLIC_URL;
