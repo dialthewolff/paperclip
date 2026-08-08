@@ -1,0 +1,16 @@
+# Layer this file after the deployment's normal Compose file. For the bundled
+# quickstart, add `-f docker/docker-compose.wolff-law-ops.yml`.
+#
+# This makes the existing Paperclip routine able to reach the Wolff Law Ops
+# API at http://api:8000. Its scoped API-key reference stays in Paperclip;
+# do not add Microsoft credentials or secret values here.
+services:
+  paperclip:
+    networks:
+      - default
+      - law_ops
+
+networks:
+  law_ops:
+    name: "${WOLFF_LAW_OPS_DOCKER_NETWORK:-deploy_default}"
+    external: true
