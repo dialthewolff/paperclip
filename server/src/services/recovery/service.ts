@@ -115,6 +115,7 @@ type RecoveryWakeupOptions = {
   reason?: string | null;
   payload?: Record<string, unknown> | null;
   idempotencyKey?: string | null;
+  equivalentIdempotencyKeys?: string[];
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
@@ -4940,6 +4941,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       candidateLimitSkipped: 0,
       deferredOrFailed: 0,
       enqueueFailed: 0,
+      activityLogFailed: 0,
       issueIds: [] as string[],
     };
 
@@ -5091,8 +5093,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
+        let wake: typeof heartbeatRuns.$inferSelect | null;
         try {
-          const wake = await deps.enqueueWakeup(agentId, {
+          wake = await deps.enqueueWakeup(agentId, {
             source: "automation",
             triggerDetail: "system",
             reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
@@ -5103,6 +5106,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               backstop: payloadBackstop,
             },
             idempotencyKey,
+            equivalentIdempotencyKeys: idempotencyKeys,
             requestedByActorType: "system",
             requestedByActorId,
             contextSnapshot: {
@@ -5114,17 +5118,36 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               blockerIssueIds: readiness.blockerIssueIds,
             },
           });
-          if (!wake) {
-            // enqueueWakeup returns null for normal deferred/skipped paths
-            // such as disabled wake-on-demand or concurrency gating. That is
-            // not an enqueue error, but the backstop still did not heal now.
-            result.deferredOrFailed += 1;
+        } catch (err) {
+          result.deferredOrFailed += 1;
+          result.enqueueFailed += 1;
+          logger.warn(
+            { err, issueId: candidate.id, agentId, idempotencyKey, source },
+            "failed to enqueue dependency wake from issue graph liveness backstop",
+          );
+          continue;
+        }
+        if (!wake) {
+          // enqueueWakeup returns null for normal deferred/skipped paths
+          // such as disabled wake-on-demand or an idempotent wake found
+          // while holding the issue row lock. That is not an enqueue error,
+          // but the backstop still did not heal now.
+          const idempotentWake = await findExistingIssueBlockersResolvedWakeForAnyKey(db, {
+            companyId,
+            idempotencyKeys,
+          });
+          if (idempotentWake) {
+            result.existingWakeSkipped += 1;
             continue;
           }
+          result.deferredOrFailed += 1;
+          continue;
+        }
 
-          result.healed += 1;
-          result.issueIds.push(candidate.id);
+        result.healed += 1;
+        result.issueIds.push(candidate.id);
 
+        try {
           await logActivity(db, {
             companyId,
             actorType: "system",
@@ -5143,11 +5166,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             },
           });
         } catch (err) {
-          result.deferredOrFailed += 1;
-          result.enqueueFailed += 1;
+          result.activityLogFailed += 1;
           logger.warn(
             { err, issueId: candidate.id, agentId, idempotencyKey, source },
-            "failed to enqueue dependency wake from issue graph liveness backstop",
+            "failed to record dependency wake activity from issue graph liveness backstop",
           );
         }
       }
@@ -5230,6 +5252,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       dependencyWakeCandidateLimitSkipped: 0,
       dependencyWakeDeferredOrFailed: 0,
       dependencyWakeEnqueueFailed: 0,
+      dependencyWakeActivityLogFailed: 0,
       dependencyWakeIssueIds: [] as string[],
       issueIds: [] as string[],
       escalationIssueIds: [] as string[],
@@ -5249,6 +5272,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     result.dependencyWakeCandidateLimitSkipped = dependencyWakeBackstop.candidateLimitSkipped;
     result.dependencyWakeDeferredOrFailed = dependencyWakeBackstop.deferredOrFailed;
     result.dependencyWakeEnqueueFailed = dependencyWakeBackstop.enqueueFailed;
+    result.dependencyWakeActivityLogFailed = dependencyWakeBackstop.activityLogFailed;
     result.dependencyWakeIssueIds = dependencyWakeBackstop.issueIds;
 
     if (!autoRecoveryEnabled) {

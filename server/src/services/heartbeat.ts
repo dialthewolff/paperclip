@@ -2054,6 +2054,7 @@ interface WakeupOptions {
   reason?: string | null;
   payload?: Record<string, unknown> | null;
   idempotencyKey?: string | null;
+  equivalentIdempotencyKeys?: string[];
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
@@ -15573,6 +15574,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return { kind: "skipped" as const };
         }
 
+        const idempotencyKeys = [...new Set(
+          [opts.idempotencyKey, ...(opts.equivalentIdempotencyKeys ?? [])]
+            .filter((key): key is string => Boolean(key)),
+        )];
+        const existingIdempotentWake = idempotencyKeys.length > 0
+          ? await tx
+            .select({ id: agentWakeupRequests.id })
+            .from(agentWakeupRequests)
+            .where(and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              inArray(agentWakeupRequests.idempotencyKey, idempotencyKeys),
+              inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution", "claimed", "completed"]),
+            ))
+            .limit(1)
+            .then((rows) => rows[0] ?? null)
+          : null;
+        if (existingIdempotentWake) return { kind: "idempotent" as const };
+
         if (worktreeExecutionCutoff && issue.createdAt < worktreeExecutionCutoff) {
           await tx.insert(agentWakeupRequests).values({
             companyId: agent.companyId,
@@ -16292,7 +16311,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return { kind: "queued" as const, run: newRun };
       });
 
-      if (outcome.kind === "deferred" || outcome.kind === "skipped") return null;
+      if (outcome.kind === "deferred" || outcome.kind === "skipped" || outcome.kind === "idempotent") return null;
       if (outcome.kind === "coalesced") {
         await startNextQueuedRunForAgent(agent.id);
         return outcome.run;

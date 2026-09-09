@@ -41,6 +41,87 @@ const mockAdapterExecute = vi.hoisted(() =>
   })),
 );
 
+const dependencyWakeDedupeBarrier = vi.hoisted(() => {
+  let enabled = false;
+  let calls = 0;
+  let release: (() => void) | null = null;
+  let arrived: (() => void) | null = null;
+  let gate: Promise<void> | null = null;
+
+  return {
+    arm() {
+      enabled = true;
+      calls = 0;
+      const bothArrived = new Promise<void>((resolve) => { arrived = resolve; });
+      gate = new Promise<void>((resolve) => { release = resolve; });
+      return { bothArrived, release: () => release?.() };
+    },
+    async wait() {
+      if (!enabled || calls >= 2) return;
+      calls += 1;
+      if (calls === 2) arrived?.();
+      await gate;
+    },
+    reset() {
+      release?.();
+      enabled = false;
+      calls = 0;
+      release = null;
+      arrived = null;
+      gate = null;
+    },
+  };
+});
+
+const dependencyWakeBlockerOrder = vi.hoisted(() => {
+  let remaining = 0;
+  let selectedBlockerIds: string[] = [];
+
+  return {
+    arm() {
+      remaining = 2;
+      selectedBlockerIds = [];
+    },
+    reorder(readiness: Map<string, { blockerIssueIds: string[] }>) {
+      if (remaining === 0) return readiness;
+      const reverse = remaining === 1;
+      remaining -= 1;
+      const ordered = reverse
+        ? new Map([...readiness].map(([issueId, entry]) => [
+          issueId,
+          { ...entry, blockerIssueIds: [...entry.blockerIssueIds].reverse() },
+        ]))
+        : readiness;
+      const selectedBlockerId = [...ordered.values()][0]?.blockerIssueIds[0];
+      if (selectedBlockerId) selectedBlockerIds.push(selectedBlockerId);
+      return ordered;
+    },
+    selectedBlockerIds: () => selectedBlockerIds,
+    reset() {
+      remaining = 0;
+      selectedBlockerIds = [];
+    },
+  };
+});
+
+const dependencyWakeActivityFailure = vi.hoisted(() => {
+  let failNext = false;
+
+  return {
+    failNext() {
+      failNext = true;
+    },
+    shouldFail(action: string | null | undefined) {
+      if (!failNext || action !== "issue.blockers_resolved_wake_emitted") return false;
+      failNext = false;
+      return true;
+    },
+    reset() {
+      failNext = false;
+    },
+  };
+});
+
 vi.mock("../telemetry.ts", () => ({
   getTelemetryClient: () => ({ track: vi.fn() }),
 }));
@@ -52,6 +133,49 @@ vi.mock("@paperclipai/shared/telemetry", async () => {
   return {
     ...actual,
     trackAgentFirstHeartbeat: vi.fn(),
+  };
+});
+
+vi.mock("../services/issue-dependency-wakeups.ts", async () => {
+  const actual = await vi.importActual<typeof import("../services/issue-dependency-wakeups.ts")>(
+    "../services/issue-dependency-wakeups.ts",
+  );
+  return {
+    ...actual,
+    findExistingIssueBlockersResolvedWakeForAnyKey: async (
+      ...args: Parameters<typeof actual.findExistingIssueBlockersResolvedWakeForAnyKey>
+    ) => {
+      await dependencyWakeDedupeBarrier.wait();
+      return actual.findExistingIssueBlockersResolvedWakeForAnyKey(...args);
+    },
+  };
+});
+
+vi.mock("../services/issues.ts", async () => {
+  const actual = await vi.importActual<typeof import("../services/issues.ts")>("../services/issues.ts");
+  return {
+    ...actual,
+    issueService: (...factoryArgs: Parameters<typeof actual.issueService>) => {
+      const service = actual.issueService(...factoryArgs);
+      return {
+        ...service,
+        listDependencyReadiness: async (...args: Parameters<typeof service.listDependencyReadiness>) =>
+          dependencyWakeBlockerOrder.reorder(await service.listDependencyReadiness(...args)),
+      };
+    },
+  };
+});
+
+vi.mock("../services/activity-log.ts", async () => {
+  const actual = await vi.importActual<typeof import("../services/activity-log.ts")>("../services/activity-log.ts");
+  return {
+    ...actual,
+    logActivity: async (...args: Parameters<typeof actual.logActivity>) => {
+      if (dependencyWakeActivityFailure.shouldFail(args[1]?.action)) {
+        throw new Error("synthetic dependency wake activity failure");
+      }
+      return actual.logActivity(...args);
+    },
   };
 });
 
@@ -91,6 +215,9 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
   }, 30_000);
 
   afterEach(async () => {
+    dependencyWakeDedupeBarrier.reset();
+    dependencyWakeBlockerOrder.reset();
+    dependencyWakeActivityFailure.reset();
     vi.clearAllMocks();
     runningProcesses.clear();
     // reconcileIssueGraphLiveness heals dependency wakes by enqueuing an
@@ -231,12 +358,13 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
   async function seedResolvedDependencyBackstopFixture(opts: {
     workspaceState?: "none" | "not_finalized" | "finalized";
     assignee?: "agent" | null;
+    blockedIssueId?: string;
   } = {}) {
     const workspaceState = opts.workspaceState ?? "none";
     const companyId = randomUUID();
     const agentId = randomUUID();
     const ownerUserId = randomUUID();
-    const blockedIssueId = randomUUID();
+    const blockedIssueId = opts.blockedIssueId ?? randomUUID();
     const blockerIssueId = randomUUID();
     const projectId = randomUUID();
     const projectWorkspaceId = randomUUID();
@@ -439,6 +567,184 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "issue.blockers_resolved_wake_emitted")));
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ entityId: blockedIssueId });
+  });
+
+  it("examines a dependency-ready candidate beyond the backstop page on the next call", async () => {
+    const blockedIssueId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    const { companyId, agentId, blockerIssueId } = await seedResolvedDependencyBackstopFixture({
+      workspaceState: "none",
+      blockedIssueId,
+    });
+    await db.insert(issues).values(Array.from({ length: 500 }, (_, index) => ({
+      id: `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`,
+      companyId,
+      title: `Unready candidate ${index + 1}`,
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: index + 3,
+      identifier: `PAGED-${index + 3}`,
+    })));
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.reconcileIssueGraphLiveness();
+    expect(first.dependencyWakeBackstopChecked).toBe(500);
+    expect(first.dependencyWakeCandidateLimitSkipped).toBe(1);
+    expect(first.dependencyWakesHealed).toBe(0);
+
+    const second = await heartbeat.reconcileIssueGraphLiveness();
+    expect(second.dependencyWakeBackstopChecked).toBe(1);
+    expect(second.dependencyWakesHealed).toBe(1);
+    expect(second.dependencyWakeIssueIds).toEqual([blockedIssueId]);
+
+    const wakes = await db
+      .select({ idempotencyKey: agentWakeupRequests.idempotencyKey })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.reason, "issue_blockers_resolved"),
+      ));
+    expect(wakes).toEqual([{
+      idempotencyKey: `issue_blockers_resolved:${blockedIssueId}:${blockerIssueId}`,
+    }]);
+
+    const events = await db
+      .select({ entityId: activityLog.entityId })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.action, "issue.blockers_resolved_wake_emitted"),
+      ));
+    expect(events).toEqual([{ entityId: blockedIssueId }]);
+  });
+
+  it("deduplicates concurrent dependency wake reconciliation", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const heartbeat = heartbeatService(db);
+    const barrier = dependencyWakeDedupeBarrier.arm();
+
+    const reconciliation = Promise.all([
+      heartbeat.reconcileIssueGraphLiveness(),
+      heartbeat.reconcileIssueGraphLiveness(),
+    ]);
+    await barrier.bothArrived;
+    barrier.release();
+    const results = await reconciliation;
+    expect(results.filter((result) => result.dependencyWakesHealed === 1)).toHaveLength(1);
+    expect(results.filter((result) => result.dependencyWakeExistingSkipped === 1)).toHaveLength(1);
+
+    const wakes = await db
+      .select({ idempotencyKey: agentWakeupRequests.idempotencyKey })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.reason, "issue_blockers_resolved"),
+      ));
+    expect(wakes).toEqual([{
+      idempotencyKey: `issue_blockers_resolved:${blockedIssueId}:${blockerIssueId}`,
+    }]);
+
+    const events = await db
+      .select({ entityId: activityLog.entityId })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.action, "issue.blockers_resolved_wake_emitted"),
+      ));
+    expect(events).toEqual([{ entityId: blockedIssueId }]);
+  });
+
+  it("deduplicates concurrent dependency wakes across equivalent blocker keys", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const secondBlockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: secondBlockerIssueId,
+      companyId,
+      title: "Second completed blocker",
+      status: "done",
+      priority: "medium",
+      issueNumber: 3,
+      identifier: "R-CONCURRENT-3",
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: secondBlockerIssueId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+    const readiness = await issueService(db).getDependencyReadiness(blockedIssueId);
+    expect(readiness.blockerIssueIds).toEqual(expect.arrayContaining([blockerIssueId, secondBlockerIssueId]));
+
+    const heartbeat = heartbeatService(db);
+    dependencyWakeBlockerOrder.arm();
+    const barrier = dependencyWakeDedupeBarrier.arm();
+    const reconciliation = Promise.all([
+      heartbeat.reconcileIssueGraphLiveness(),
+      heartbeat.reconcileIssueGraphLiveness(),
+    ]);
+    await barrier.bothArrived;
+    barrier.release();
+    const results = await reconciliation;
+
+    expect(new Set(dependencyWakeBlockerOrder.selectedBlockerIds()).size).toBe(2);
+    expect(results.filter((result) => result.dependencyWakesHealed === 1)).toHaveLength(1);
+    expect(results.filter((result) => result.dependencyWakeExistingSkipped === 1)).toHaveLength(1);
+
+    const wakes = await db
+      .select({ idempotencyKey: agentWakeupRequests.idempotencyKey })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.reason, "issue_blockers_resolved"),
+      ));
+    expect(wakes).toHaveLength(1);
+    expect([blockerIssueId, secondBlockerIssueId]).toContain(
+      wakes[0]?.idempotencyKey?.split(":").at(-1),
+    );
+
+    const events = await db
+      .select({ entityId: activityLog.entityId })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.action, "issue.blockers_resolved_wake_emitted"),
+      ));
+    expect(events).toEqual([{ entityId: blockedIssueId }]);
+  });
+
+  it("reports activity logging failure after healing a dependency wake", async () => {
+    const { companyId, agentId, blockedIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    dependencyWakeActivityFailure.failNext();
+
+    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+    expect(result.dependencyWakesHealed).toBe(1);
+    expect(result.dependencyWakeIssueIds).toEqual([blockedIssueId]);
+    expect(result.dependencyWakeDeferredOrFailed).toBe(0);
+    expect(result.dependencyWakeEnqueueFailed).toBe(0);
+    expect(result.dependencyWakeActivityLogFailed).toBe(1);
+
+    const wakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.reason, "issue_blockers_resolved"),
+      ));
+    expect(wakes).toHaveLength(1);
+
+    const events = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.action, "issue.blockers_resolved_wake_emitted"),
+      ));
+    expect(events).toHaveLength(0);
   });
 
   it("reconciles a resolved blocked dependency after the assignee-null window closes", async () => {
