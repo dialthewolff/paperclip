@@ -329,7 +329,9 @@ export async function testEnvironment(
     } else {
       const execArgs = buildCodexExecArgs(
         { ...config, fastMode: false },
-        { skipGitRepoCheck: targetIsSandbox },
+        // The environment probe validates runtime/authentication, not repository
+        // trust. Real Codex runs retain their normal repository trust checks.
+        { skipGitRepoCheck: true },
       );
       const args = execArgs.args;
       if (execArgs.fastModeIgnoredReason) {
